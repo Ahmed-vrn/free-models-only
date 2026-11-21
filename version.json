@@ -1,11 +1,20 @@
 {
   "name": "free-models-only",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "schema_version": 1,
   "updated": "2026-11-21",
-  "source": "https://opencode.ai/docs/console/models",
-  "opencode_docs": [
-    "https://opencode.ai/docs/providers",
-    "https://opencode.ai/docs/models"
-  ],
-  "paid_ids_count": 80
+  "python": ">=3.9",
+  "sources": {
+    "opencode": "https://opencode.ai/inference/v1/models",
+    "openrouter": "https://openrouter.ai/api/v1/models",
+    "docs": "https://opencode.ai/docs/console/models"
+  },
+  "opencode_snapshot": {
+    "api_models": 104,
+    "verified_zero": 11,
+    "paid": 92,
+    "unknown": 1,
+    "runtime_only_unknown": 2
+  },
+  "fallback_paid_ids": 92
 }

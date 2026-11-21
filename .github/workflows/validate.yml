@@ -10,10 +10,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate apply.py on a sample config
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile scripts
+        run: python3 -m py_compile scripts/*.py
+
+      - name: Run unit tests (no network)
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Validate metadata and fallback list
         run: |
-          mkdir -p sample
-          cat > sample/opencode.jsonc <<'EOF'
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          v = json.loads(Path("version.json").read_text())
+          assert v["name"] == "free-models-only"
+          assert v["version"].startswith("2.")
+          ids = [line.strip() for line in Path("references/paid-model-ids.txt").read_text().splitlines()
+                 if line.strip() and not line.startswith("#")]
+          assert len(ids) > 50
+          print("OK:", len(ids), "fallback ids, version", v["version"])
+          PY
+
+      - name: Dry-run on a sample config
+        run: |
+          tmp="$(mktemp -d)"
+          cat > "$tmp/opencode.jsonc" <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
             "model": "opencode/deepseek-v4.1-flash-free",
@@ -22,20 +47,5 @@ jobs:
             "shell": "/bin/bash"
           }
           EOF
-          python3 scripts/apply.py --config sample/opencode.jsonc \
+          python3 scripts/apply.py --config "$tmp/opencode.jsonc" \
             --paid-file references/paid-model-ids.txt --dry-run
-          python3 scripts/apply.py --config sample/opencode.jsonc \
-            --paid-file references/paid-model-ids.txt
-          grep -q '"gpt-5.5-pro": { "disabled": true }' sample/opencode.jsonc
-          grep -q '"model": "opencode/deepseek-v4.1-flash-free"' sample/opencode.jsonc
-      - name: Validate version.json and paid list are non-empty
-        run: |
-          python3 - <<'PY'
-          import json
-          v = json.load(open("version.json"))
-          assert v["name"] == "free-models-only"
-          ids = [x.strip() for x in open("references/paid-model-ids.txt")
-                 if x.strip() and not x.startswith("#")]
-          assert len(ids) > 50
-          print("OK:", len(ids), "paid ids, version", v["version"])
-          PY

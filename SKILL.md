@@ -1,114 +1,188 @@
 ---
 name: Free Models Only
-description: Hide every paid OpenCode model and keep only free ones — use when the user wants to disable paid models, restrict the model catalog to free tier, or refresh the free-only list after a catalog update.
+description: Discover, classify, and hide every paid or unknown OpenCode model while keeping genuinely free ones; includes dry-run, default protection, smoke tests, and safe JSONC updates.
 metadata:
   opencode/autoinvoke: true
 ---
 
-# Free Models Only
+# Free Models Only v2.0
 
-Replace the managed block in `~/.config/opencode/opencode.jsonc` so that only
-models with zero input and output cost remain selectable in OpenCode.
+اجعل OpenCode يعرض النماذج المجانية فقط، انطلاقاً من **أسعار رسمية** لا من
+الاسم أو كلمة `free`. المهارة لا تنشئ حسابات، ولا تستخرج مفاتيح، ولا تثبّت
+مزوّدين أو إضافات، ولا تستخدم fallback مدفوعاً.
 
-This directory is itself a git repository: updating the skill is `git pull`.
-See `README.md` for installation on another machine.
+هذا المجلد مستودع Git: التحديث عبر `git pull` ثم `scripts/install.sh`.
 
-## When to use
+## سياسة التصنيف
 
-- "احذف كل النماذج المدفوعة واترك المجانية فقط"
-- "Disable paid models / keep only free models"
-- After OpenCode rotates or adds model IDs and paid models reappear in `/models`.
+كل نموذج يأخذ تصنيفاً واحداً فقط:
 
-## How it works
+| التصنيف | المعنى | ماذا يفعل `apply.py` |
+| --- | --- | --- |
+| `verified_zero` | سعر رسمي صفر لكل حقول التكلفة، ونموذج chat | يبقى مفعّلاً |
+| `quota_free` | سعر صفر لكن يلزم حساب/مفتاح وحصة محدودة | يبقى افتراضياً، ويُعطّل مع `--disable-quota-free` |
+| `funded_account_required` | سعر صفر لكن يلزم شحن أو رصيد | يُعطّل |
+| `local` | تشغيل محلي بلا فاتورة API | يبقى مفعّلاً |
+| `paid` | سعر رسمي موجب | يُعطّل |
+| `unknown` | السعر أو النوع غير مؤكد | يُعطّل |
 
-OpenCode V2 has no whitelist setting. The supported mechanism is
-`providers.opencode.models.<model-id>.disabled = true` (documented at
-`https://opencode.ai/docs/providers` → Models table, and `https://opencode.ai/docs/models`).
-The script writes one entry per paid model ID.
+قواعد إلزامية:
 
-The config block is delimited by these markers and is replaced as a whole on
-every run; everything else in the file is preserved:
+- السعر المفقود = `unknown`، وليس صفراً.
+- لا تُستنتج المجانية من الاسم أو لاحقة `:free`.
+- لا يُنقل حكم السعر من مزوّد إلى آخر.
+- لا يُستخدم نموذج مدفوع كبديل عند فشل المجاني.
+- `unknown` يُعطّل في وضع المجاني فقط، حتى لا يظهر نموذج مجهول التكلفة.
 
-```
-  // >>> free-models-only: START (managed — do not edit manually)
-  ...
-  // <<< free-models-only: END
-```
+## المصادر
 
-## Workflow
+- OpenCode: `https://opencode.ai/inference/v1/models`
+  - السعر تحت `cost.text.input.price` و`cost.text.output.price`.
+  - تُفحص أيضاً تكاليف `image` و`audio` و`video` و`cache`.
+- OpenRouter: `https://openrouter.ai/api/v1/models`
+  - الأسعار لكل token، وتُحوَّل إلى سعر لكل مليون token.
+  - `-1` تعني سعراً ديناميكياً غير معروف، وليست مجانية.
+- صفحة الوثائق `https://opencode.ai/docs/console/models` للتحقق البشري فقط،
+  وليست مصدراً آلياً موثوقاً للتصنيف.
 
-1. Fetch the official Console models page (authoritative free/paid list):
+## سير العمل
 
-   ```bash
-   curl -sS https://opencode.ai/docs/console/models -o /tmp/opencode/console-models.html
-   ```
+من داخل مجلد المهارة:
 
-   Or use `webfetch` on `https://opencode.ai/docs/console/models` and read the
-   **Pricing** table: a model is free only when both Input and Output show `Free`.
-
-2. Build the paid ID list. Use the **Model / Model ID** table to map display
-   names to IDs, then exclude IDs whose pricing row says `Free` for input and
-   output. Also exclude these always-free IDs (from the Free models section):
-
-   ```
-   big-pickle iceman-free inkling-2-small-free deepseek-v4.1-flash-free
-   beam-free flint-40b-free longcat-2.5-free hy4-flash-free
-   mimo-v2.6-flash-free nemotron-3.5-lightning-free
-   nemotron-3.5-super-vl-free jev-1.13-free tidepool-alpha-free
-   ```
-
-   Known paid IDs are in `references/paid-model-ids.txt` (fallback). Merge them
-   with anything newly discovered — never remove an ID from that file without
-   checking the official pricing table.
-
-3. Write the merged, sorted, unique IDs (one per line) to
-   `/tmp/opencode/paid-ids.txt`, then apply. Paths below are relative to this
-   skill directory:
-
-   ```bash
-   python3 scripts/apply.py --paid-file references/paid-model-ids.txt
-   ```
-
-   Use `--dry-run` first to preview. The script validates the config with a
-   JSONC-tolerant parser, replaces only the managed block, and prints how many
-   IDs were disabled.
-
-4. Verify with the Code Mode model catalog tool:
-
-   ```javascript
-   const r = await tools.opencode.models({ limit: 100 })
-   const all = r.providers.flatMap(p => p.models.map(m => ({
-     id: m.id,
-     cost: m.cost?.[0]?.input ?? 0,
-     output: m.cost?.[0]?.output ?? 0,
-   })))
-   return { count: all.length, paidLeft: all.filter(m => m.cost > 0 || m.output > 0) }
-   ```
-
-   `paidLeft` must be empty. If a paid model appears, add its ID to
-   `references/paid-model-ids.txt` and rerun step 3.
-
-5. Confirm the configured default still runs:
-
-   ```bash
-   "$HOME/.config/ai.opencode.desktop/cli/2.3.2-x64/opencode-cli" run "Reply with exactly: FREE_OK"
-   ```
-
-## Update
+### 1. الاكتشاف
 
 ```bash
-git -C "$HOME/.config/opencode/skills/free-models-only" pull
-bash "$HOME/.config/opencode/skills/free-models-only/scripts/install.sh"
+python3 scripts/discover.py
 ```
 
-`install.sh` re-applies the managed block from the updated ID list. OpenCode
-reloads configuration automatically.
+يكتب `~/.cache/free-models-only/discovery.json` ويعرض ملخصاً. إذا فشلت كل
+المصادر، لا يستبدل ملف الاكتشاف السابق.
 
-## Notes
+يستعلم أيضاً `opencode models` لاكتشاف أي معرّف يظهر في التشغيل لكنه غائب عن
+الكتالوج الرسمي؛ يُصنَّف هذا المعرّف `unknown` ويُعطَّل. استخدم `--no-runtime`
+لتجاهل هذه الخطوة.
 
-- The catalog is dynamic: OpenCode may rotate IDs (e.g. `gemini-4-neon` →
-  `gemini-4-carbon`). Re-run this skill after an OpenCode update.
-- Do not disable the model used by the current session — configuration changes
-  reload automatically for new requests, but a selected session model keeps its
-  setting for that turn.
-- `OPENCODE_DISABLE_FREE_MODELS=1` does the opposite; never set it here.
+### 2. مراجعة النتيجة
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path.home() / ".cache/free-models-only/discovery.json"
+d = json.loads(p.read_text())
+print(d["summary"])
+for m in d["models"]:
+    if m["classification"] in ("verified_zero", "unknown"):
+        print(m["classification"], m["provider_id"] + "/" + m["model_id"])
+PY
+```
+
+### 3. معاينة التطبيق
+
+```bash
+python3 scripts/apply.py \
+  --discovery "$HOME/.cache/free-models-only/discovery.json" \
+  --dry-run
+```
+
+### 4. التطبيق
+
+```bash
+python3 scripts/apply.py \
+  --discovery "$HOME/.cache/free-models-only/discovery.json" \
+  --apply
+```
+
+`apply.py` يستبدل الكتلة بين علامتي `free-models-only` فقط، ويحتفظ بكل
+التعليقات والإعدادات خارجها. ينشئ نسخة احتياطية، ويكتب ذرياً، ويرفض تعطيل
+النموذج الافتراضي.
+
+### 5. فحص الدخان
+
+```bash
+python3 scripts/probe.py \
+  --discovery "$HOME/.cache/free-models-only/discovery.json" \
+  --limit 3
+```
+
+يفحص فقط `verified_zero` افتراضياً، بحد أقصى 3 نماذج (10 كحد أقصى)، عبر
+`opencode run --model provider/model`، وبلا إعادة محاولة. لا يفحص `quota_free`
+إلا مع `--include-quota-free`، ولا المدفوع إلا مع `--allow-nonfree`.
+
+### 6. التحقق النهائي
+
+```bash
+CLI="$(command -v opencode || find "$HOME/.config/ai.opencode.desktop" -name opencode-cli 2>/dev/null | head -n 1)"
+"$CLI" run --model opencode/deepseek-v4.1-flash-free \
+  "Reply with exactly: FREE_MODEL_TEST_OK"
+```
+
+ثم تحقق أن قائمة النماذج لا تحتوي مدفوعاً. يمكن استخدام أداة Code Mode:
+
+```javascript
+const r = await tools.opencode.models({ limit: 100 })
+const all = r.providers.flatMap(p => p.models.map(m => ({
+  id: m.id,
+  input: m.cost?.[0]?.input ?? null,
+  output: m.cost?.[0]?.output ?? null,
+})))
+return {
+  count: all.length,
+  paidLeft: all.filter(m => (m.input ?? 0) > 0 || (m.output ?? 0) > 0),
+  unknownLeft: all.filter(m => m.input === null || m.output === null),
+}
+```
+
+## النطاق
+
+- الافتراضي: الإعداد العام `~/.config/opencode/opencode.jsonc`.
+- مشروع محدد: `--scope project`، ويبحث عن `.opencode/opencode.jsonc` أو
+  `.opencode/opencode.json` صعوداً من مجلد العمل.
+- مسار صريح: `--config /path/to/opencode.jsonc`.
+
+لا تُعدّل إعدادات مشروع لم يُطلب تعديله.
+
+## الأمان
+
+- لا تُكتب مفاتيح API في `opencode.jsonc`.
+- لا تُضاف تعريفات مزوّدين جديدة تلقائياً؛ تُكتب فقط مدخلات `disabled` ضمن
+  المزوّدين الموجودين، إلا مع `--include-unconfigured-providers`.
+- لا تُثبّت حزم أو plugins من نتائج البحث.
+- لا تُنشئ مهمة مجدولة تلقائياً. الجدولة قرار منفصل بعد مراجعة السكربت.
+- إذا كان الملف غير صالح، أو تغيّر النموذج الافتراضي، أو اختفت العلامات،
+  يتوقف `apply.py` دون كتابة.
+
+## التثبيت والتحديث
+
+```bash
+# تثبيت/تطبيق
+bash scripts/install.sh
+
+# معاينة فقط
+bash scripts/install.sh --dry-run
+
+# بدون شبكة (القائمة الاحتياطية)
+bash scripts/install.sh --offline
+
+# تحديث من GitHub
+bash scripts/update.sh
+```
+
+`install.sh` يضيف العلامات إذا لم تكن موجودة، ثم يشغّل الاكتشاف والتطبيق.
+إذا كان الإعداد يحتوي مفتاح `providers` بلا علامات، يتوقف ويطلب تغليفه
+بالعلامات يدوياً لتجنّب مفتاح مكرر.
+
+## الإزالة
+
+```bash
+bash scripts/uninstall.sh
+```
+
+يزيل الكتلة المُدارة فقط، ويحتفظ ببقية الإعدادات وبنسخة احتياطية.
+
+## ملاحظات
+
+- كتالوج OpenCode ديناميكي ويبدّل المعرّفات؛ أعد الاكتشاف بعد كل تحديث.
+- OpenRouter `:free` غالباً `quota_free` وليس مجانياً بلا حدود.
+- لا تعطّل النموذج المستخدم في الجلسة الحالية أثناء العمل؛ التغيير يُحمَّل
+  للطلبات الجديدة.
+- `OPENCODE_DISABLE_FREE_MODELS=1` يفعل العكس؛ لا تضبطه هنا.

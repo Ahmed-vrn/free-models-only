@@ -6,5 +6,5 @@ SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "Updating free-models-only..."
 git -C "$SKILL_DIR" pull --ff-only
-bash "$SKILL_DIR/scripts/install.sh"
+bash "$SKILL_DIR/scripts/install.sh" "$@"
 echo "Update complete."
