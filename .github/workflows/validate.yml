@@ -1,0 +1,41 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate apply.py on a sample config
+        run: |
+          mkdir -p sample
+          cat > sample/opencode.jsonc <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "model": "opencode/deepseek-v4.1-flash-free",
+            // >>> free-models-only: START (managed — do not edit manually)
+            // <<< free-models-only: END
+            "shell": "/bin/bash"
+          }
+          EOF
+          python3 scripts/apply.py --config sample/opencode.jsonc \
+            --paid-file references/paid-model-ids.txt --dry-run
+          python3 scripts/apply.py --config sample/opencode.jsonc \
+            --paid-file references/paid-model-ids.txt
+          grep -q '"gpt-5.5-pro": { "disabled": true }' sample/opencode.jsonc
+          grep -q '"model": "opencode/deepseek-v4.1-flash-free"' sample/opencode.jsonc
+      - name: Validate version.json and paid list are non-empty
+        run: |
+          python3 - <<'PY'
+          import json
+          v = json.load(open("version.json"))
+          assert v["name"] == "free-models-only"
+          ids = [x.strip() for x in open("references/paid-model-ids.txt")
+                 if x.strip() and not x.startswith("#")]
+          assert len(ids) > 50
+          print("OK:", len(ids), "paid ids, version", v["version"])
+          PY

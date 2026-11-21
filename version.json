@@ -1,0 +1,11 @@
+{
+  "name": "free-models-only",
+  "version": "1.0.0",
+  "updated": "2026-11-21",
+  "source": "https://opencode.ai/docs/console/models",
+  "opencode_docs": [
+    "https://opencode.ai/docs/providers",
+    "https://opencode.ai/docs/models"
+  ],
+  "paid_ids_count": 80
+}
