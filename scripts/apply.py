@@ -356,6 +356,32 @@ def main() -> int:
             else:
                 kept.setdefault(provider, []).append(model_id)
 
+    # A runtime-only model can disappear from every catalog once it is disabled.
+    # Keep such previously managed ids disabled unless the new discovery
+    # explicitly classifies them as free. This prevents a re-enable loop.
+    discovered = {
+        (str(model.get("provider_id") or ""), str(model.get("model_id") or ""))
+        for models in by_provider.values()
+        for model in models
+    }
+    carried_over: List[Tuple[str, str]] = []
+    for provider_name, provider_conf in providers_config.items():
+        if not isinstance(provider_conf, dict):
+            continue
+        models_conf = provider_conf.get("models")
+        if not isinstance(models_conf, dict):
+            continue
+        for model_id, model_conf in models_conf.items():
+            if not isinstance(model_conf, dict) or model_conf.get("disabled") is not True:
+                continue
+            key = (str(provider_name), str(model_id))
+            if key in discovered:
+                continue
+            if model_id in disabled.get(str(provider_name), []):
+                continue
+            disabled.setdefault(str(provider_name), []).append(str(model_id))
+            carried_over.append(key)
+
     # Protect the configured default model before writing anything.
     default_ref = old_config.get("model")
     default_provider = None
@@ -426,6 +452,8 @@ def main() -> int:
         "disabled_count": total_disabled,
         "disabled_by_provider": {name: sorted(set(ids)) for name, ids in sorted(disabled.items())},
         "kept_count": total_kept,
+        "carried_over_count": len(carried_over),
+        "carried_over": ["%s/%s" % item for item in sorted(carried_over)],
         "skipped_providers": sorted(skipped_providers),
         "warnings": warnings,
     }
@@ -439,6 +467,8 @@ def main() -> int:
                 print("  %-12s %d" % (provider, len(set(disabled[provider]))))
             for warning in warnings:
                 print("  warning: %s" % warning)
+            if carried_over:
+                print("  carried over %d previously disabled id(s)" % len(carried_over))
             print("  config: %s" % config_path)
         return 0
 
@@ -487,6 +517,8 @@ def main() -> int:
         print("  backup: %s" % backup_path)
         for warning in warnings:
             print("  warning: %s" % warning)
+        if carried_over:
+            print("  carried over %d previously disabled id(s)" % len(carried_over))
     return 0
 
 

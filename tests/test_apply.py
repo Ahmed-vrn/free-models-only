@@ -96,12 +96,26 @@ class ApplyTests(unittest.TestCase):
         self.assertTrue(models["paid-model"]["disabled"])
         self.assertTrue(models["unknown-model"]["disabled"])
         self.assertNotIn("free-model", models)
-        self.assertNotIn("old-paid", models)
+        self.assertTrue(models["old-paid"]["disabled"])
         self.assertNotIn("openrouter", parsed["providers"])
         self.assertEqual(parsed["model"], "opencode/free-model")
         self.assertIn("// keep this comment", text)
         self.assertIn('"shell": "/bin/bash"', text)
         self.assertEqual(parsed["permissions"], [])
+
+    def test_previous_disabled_free_model_is_reenabled(self):
+        text = CONFIG_TEMPLATE % {"default": "opencode/free-model"}
+        text = text.replace(
+            '"old-paid": { "disabled": true }',
+            '"old-paid": { "disabled": true },\n        "free-model": { "disabled": true }',
+        )
+        self.config.write_text(text, encoding="utf-8")
+        result = self.run_apply("--discovery", str(self.disc), "--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = parse_jsonc(self.config.read_text(encoding="utf-8"))
+        models = parsed["providers"]["opencode"]["models"]
+        self.assertNotIn("free-model", models)
+        self.assertTrue(models["old-paid"]["disabled"])
 
     def test_dry_run_does_not_write(self):
         before = self.config.read_text(encoding="utf-8")
