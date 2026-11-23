@@ -28,7 +28,8 @@ jobs:
           from pathlib import Path
           v = json.loads(Path("version.json").read_text())
           assert v["name"] == "free-models-only"
-          assert v["version"].startswith("2.")
+          assert v["version"].startswith("3.")
+          assert "models_dev_veto" in v["sources"]
           ids = [line.strip() for line in Path("references/paid-model-ids.txt").read_text().splitlines()
                  if line.strip() and not line.startswith("#")]
           assert len(ids) > 50

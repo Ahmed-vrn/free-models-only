@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Apply a discovery document to an OpenCode JSONC config safely.
+"""Free Models Only v3.0 - safe atomic JSONC enforcer.
 
-The script owns only the block between the two ``free-models-only`` markers.
-Everything outside that block is preserved byte-for-byte, including comments.
+Owns only the block between the ``free-models-only`` markers. Everything else
+in the config is preserved byte-for-byte, including comments. New in v3:
 
-Safety rules:
-* dry-run is the default; pass ``--apply`` to write;
-* the configured default model is never disabled;
-* a timestamped backup is created before any write;
-* the new file is parsed before it replaces the old one;
-* symlinked configs are refused unless ``--allow-symlink`` is given.
+* protects ``model``, ``small_model``, ``default_model`` and ``agent.*.model``;
+* keeps tombstones in ``~/.cache/free-models-only/state.json`` so a model
+  hidden by the skill never reappears just because it vanished from runtime;
+* honours ``--require-zero-retention``;
+* accepts both v3 (``// BEGIN ...``) and legacy v2 markers;
+* dry-run by default; timestamped backup + fsync + atomic replace on write.
 """
 
 from __future__ import annotations
@@ -22,33 +22,29 @@ import shutil
 import stat
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-START = "  // >>> free-models-only: START (managed — do not edit manually)\n"
-END = "  // <<< free-models-only: END\n"
-DEFAULT_CONFIG = Path.home() / ".config/opencode/opencode.jsonc"
-DISABLE_CLASSIFICATIONS = {"paid", "unknown", "funded_account_required"}
-ALL_CLASSIFICATIONS = {
-    "verified_zero",
-    "quota_free",
-    "funded_account_required",
-    "local",
-    "paid",
-    "unknown",
+MARKER_STYLES: Tuple[Tuple[str, str], ...] = (
+    ("// BEGIN free-models-only", "// END free-models-only"),
+    ("// >>> free-models-only: START (managed — do not edit manually)", "// <<< free-models-only: END"),
+)
+DEFAULT_CONFIG = Path.home() / ".config" / "opencode" / "opencode.jsonc"
+DEFAULT_STATE = Path.home() / ".cache" / "free-models-only" / "state.json"
+ALLOWED_CLASSIFICATIONS = {"verified_zero", "quota_free", "local"}
+KNOWN_CLASSIFICATIONS = {
+    "verified_zero", "quota_free", "funded_account_required", "local", "paid", "unknown"
 }
 
 
 # ---------------------------------------------------------------------------
-# JSONC helpers (string-aware, no third-party dependency)
+# JSONC helpers (string-aware, standard library only)
 # ---------------------------------------------------------------------------
 def strip_comments(text: str) -> str:
     out: List[str] = []
-    i = 0
-    n = len(text)
-    in_string = False
-    quote = ""
+    i, n = 0, len(text)
+    in_string, quote = False, ""
     while i < n:
         char = text[i]
         if in_string:
@@ -62,8 +58,7 @@ def strip_comments(text: str) -> str:
             i += 1
             continue
         if char in ('"', "'"):
-            in_string = True
-            quote = char
+            in_string, quote = True, char
             out.append(char)
             i += 1
             continue
@@ -84,10 +79,8 @@ def strip_comments(text: str) -> str:
 
 def remove_trailing_commas(text: str) -> str:
     out: List[str] = []
-    i = 0
-    n = len(text)
-    in_string = False
-    quote = ""
+    i, n = 0, len(text)
+    in_string, quote = False, ""
     while i < n:
         char = text[i]
         if in_string:
@@ -101,8 +94,7 @@ def remove_trailing_commas(text: str) -> str:
             i += 1
             continue
         if char in ('"', "'"):
-            in_string = True
-            quote = char
+            in_string, quote = True, char
             out.append(char)
             i += 1
             continue
@@ -119,7 +111,9 @@ def remove_trailing_commas(text: str) -> str:
 
 
 def parse_jsonc(text: str) -> Dict[str, Any]:
-    cleaned = remove_trailing_commas(strip_comments(text))
+    cleaned = remove_trailing_commas(strip_comments(text)).strip()
+    if not cleaned:
+        return {}
     try:
         value = json.loads(cleaned)
     except json.JSONDecodeError as exc:
@@ -130,27 +124,98 @@ def parse_jsonc(text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Path / input helpers
+# Markers / config paths
 # ---------------------------------------------------------------------------
+def marker_span(raw: str, token: str) -> Optional[Tuple[int, int, str]]:
+    """Return (line start, line end including newline, indentation)."""
+    index = raw.find(token)
+    if index < 0:
+        return None
+    line_start = raw.rfind("\n", 0, index) + 1
+    newline = raw.find("\n", index)
+    line_end = len(raw) if newline < 0 else newline + 1
+    indent = raw[line_start:index]
+    return line_start, line_end, indent
+
+
+def find_managed_block(raw: str) -> Tuple[int, int, str, str, str]:
+    matches = []
+    for begin, end in MARKER_STYLES:
+        b, e = marker_span(raw, begin), marker_span(raw, end)
+        if b is None and e is None:
+            continue
+        if b is None or e is None:
+            raise ValueError("only one of the managed markers was found")
+        if b[1] > e[0]:
+            raise ValueError("managed block end appears before its start")
+        matches.append((b[0], e[1], b[2], begin, end))
+    if len(matches) != 1:
+        raise ValueError("expected exactly one managed block in the config")
+    return matches[0]
+
+
 def resolve_config(config: Optional[Path], scope: str) -> Path:
     if config is not None:
         return config.expanduser()
-
     if scope == "project":
         current = Path.cwd().resolve()
         for base in (current, *current.parents):
-            for relative in (".opencode/opencode.jsonc", ".opencode/opencode.json"):
+            for relative in (".opencode/opencode.jsonc", ".opencode/opencode.json",
+                             "opencode.jsonc", "opencode.json"):
                 candidate = base / relative
-                if candidate.exists():
+                if candidate.is_file():
                     return candidate
             if (base / ".git").exists():
                 break
-        raise SystemExit(
-            "error: no project config found. Expected .opencode/opencode.jsonc "
-            "or .opencode/opencode.json in the current repository."
-        )
-
+        raise ValueError("no project config found in current or parent directories")
     return DEFAULT_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# Inputs
+# ---------------------------------------------------------------------------
+def load_discovery(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], Dict[str, Any]]:
+    payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("discovery root must be an object")
+    version = str(payload.get("schema_version", ""))
+    if version not in ("1", "3", "3.0"):
+        raise ValueError("unsupported discovery schema_version: %r" % version)
+    if not isinstance(payload.get("models"), list):
+        raise ValueError("discovery file has no models array")
+
+    result: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for model in payload["models"]:
+        if not isinstance(model, dict):
+            continue
+        provider = str(model.get("provider_id") or "").strip()
+        model_id = str(model.get("model_id") or "").strip()
+        if not provider or not model_id:
+            continue
+        entry = dict(model)
+        classification = str(entry.get("classification") or "unknown")
+        entry["classification"] = classification if classification in KNOWN_CLASSIFICATIONS else "unknown"
+        result[(provider, model_id)] = entry
+    return result, payload
+
+
+def legacy_discovery(ids: Iterable[str]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    result: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for token in ids:
+        token = token.strip()
+        if not token:
+            continue
+        if "/" in token:
+            provider, model_id = token.split("/", 1)
+        else:
+            provider, model_id = "opencode", token
+        result[(provider, model_id)] = {
+            "provider_id": provider,
+            "model_id": model_id,
+            "classification": "paid",
+            "source": "fallback_list",
+        }
+    return result
 
 
 def read_paid_file(path: Path) -> List[str]:
@@ -163,84 +228,136 @@ def read_paid_file(path: Path) -> List[str]:
     return ids
 
 
-def load_discovery(path: Path) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
-    payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise SystemExit("error: discovery file root must be an object")
-    if payload.get("schema_version") != 1:
-        raise SystemExit("error: unsupported discovery schema_version")
-    models = payload.get("models")
-    if not isinstance(models, list):
-        raise SystemExit("error: discovery file has no models array")
+def load_state(path: Path) -> Set[Tuple[str, str]]:
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    result: Set[Tuple[str, str]] = set()
+    entries = data.get("disabled_models", []) if isinstance(data, dict) else []
+    for item in entries:
+        if isinstance(item, dict):
+            provider, model_id = item.get("provider_id"), item.get("model_id")
+            if provider and model_id:
+                result.add((str(provider), str(model_id)))
+        elif isinstance(item, str) and "/" in item:
+            provider, model_id = item.split("/", 1)
+            result.add((provider.strip(), model_id.strip()))
+    return result
 
-    by_provider: Dict[str, List[Dict[str, Any]]] = {}
-    for model in models:
-        if not isinstance(model, dict):
+
+def save_state(path: Path, disabled: Set[Tuple[str, str]]) -> None:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "disabled_models": [
+            {"provider_id": p, "model_id": m} for p, m in sorted(disabled)
+        ],
+    }
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def disabled_in_managed_block(raw: str, block_start: int, block_end: int) -> Set[Tuple[str, str]]:
+    """Read disabled ids that the previous run wrote inside the managed block."""
+    body = raw[block_start:block_end]
+    try:
+        parsed = parse_jsonc("{\n" + body + "\n}")
+    except ValueError:
+        return set()
+    providers = parsed.get("providers") or parsed.get("provider") or {}
+    found: Set[Tuple[str, str]] = set()
+    if not isinstance(providers, dict):
+        return found
+    for provider, conf in providers.items():
+        if not isinstance(conf, dict):
             continue
-        provider = str(model.get("provider_id") or "").strip()
-        model_id = str(model.get("model_id") or "").strip()
-        if not provider or not model_id:
+        models = conf.get("models") or {}
+        if not isinstance(models, dict):
             continue
-        classification = str(model.get("classification") or "unknown")
-        if classification not in ALL_CLASSIFICATIONS:
-            classification = "unknown"
-        entry = dict(model)
-        entry["classification"] = classification
-        by_provider.setdefault(provider, []).append(entry)
-    return by_provider, payload
+        for model_id, model_conf in models.items():
+            if isinstance(model_conf, dict) and model_conf.get("disabled") is True:
+                found.add((str(provider), str(model_id)))
+    return found
 
 
-def legacy_discovery(ids: Iterable[str]) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
-    unique = sorted({item.strip() for item in ids if item.strip()})
-    return (
-        {
-            "opencode": [
-                {
-                    "provider_id": "opencode",
-                    "model_id": model_id,
-                    "classification": "paid",
-                }
-                for model_id in unique
-            ]
-        },
-        {"schema_version": 1, "mode": "legacy-paid-list", "models": unique},
-    )
+def collect_protected_defaults(config: Dict[str, Any]) -> Dict[str, str]:
+    """Collect every active model selector across the whole config."""
+    protected: Dict[str, str] = {}
+    for key in ("model", "small_model", "default_model"):
+        value = config.get(key)
+        if isinstance(value, str) and value.strip():
+            protected[key] = value.strip()
+        elif isinstance(value, dict) and isinstance(value.get("model"), str):
+            protected[key] = value["model"].strip()
+
+    for parent in ("agent", "agents"):
+        agents = config.get(parent)
+        if not isinstance(agents, dict):
+            continue
+        for name, conf in agents.items():
+            if isinstance(conf, str) and conf.strip():
+                protected["%s.%s" % (parent, name)] = conf.strip()
+            elif isinstance(conf, dict):
+                model = conf.get("model")
+                if isinstance(model, str) and model.strip():
+                    protected["%s.%s.model" % (parent, name)] = model.strip()
+                elif isinstance(model, dict) and isinstance(model.get("model"), str):
+                    protected["%s.%s.model" % (parent, name)] = model["model"].strip()
+    return protected
+
+
+def ref_to_key(ref: str) -> Optional[Tuple[str, str]]:
+    if "/" not in ref:
+        return None
+    provider, model_id = ref.split("/", 1)
+    return provider.strip(), model_id.strip()
 
 
 # ---------------------------------------------------------------------------
-# Block rendering
+# Rendering
 # ---------------------------------------------------------------------------
-def render_block(disabled: Dict[str, List[str]]) -> str:
+def render_block(disabled: Dict[str, List[str]], indent: str, begin: str, end: str) -> str:
     lines: List[str] = [
-        START.rstrip("\n"),
-        "  // ═══════════════════════════════════════════════════════════════",
-        "  //  إخفاء النماذج المدفوعة وغير المعروفة — يبقى المجاني فقط",
-        "  //  مُدار بواسطة مهارة free-models-only — لا تُعدّل يدوياً",
-        "  //  المصدر: discovery.json المولّد من واجهات المزوّدين الرسمية",
-        "  // ═══════════════════════════════════════════════════════════════",
+        indent + begin,
+        indent + "//  مُدار بواسطة free-models-only v3.0 — لا تُعدّل يدوياً",
+        indent + "//  السياسة: مجاني مُثبت فقط؛ المصدر discovery.json + state.json",
     ]
-
-    providers = [name for name in disabled if disabled[name]]
-    providers.sort(key=lambda name: (name != "opencode", name))
-    if not providers:
-        lines.append('  "providers": {},')
+    if not disabled:
+        lines.append(indent + '"providers": {},')
     else:
-        lines.append('  "providers": {')
-        for provider_index, provider in enumerate(providers):
-            lines.append('    %s: {' % json.dumps(provider, ensure_ascii=False))
-            lines.append('      "models": {')
+        lines.append(indent + '"providers": {')
+        providers = sorted(disabled)
+        for p_index, provider in enumerate(providers):
+            lines.append(indent + "  " + json.dumps(provider, ensure_ascii=False) + ": {")
+            lines.append(indent + '    "models": {')
             model_ids = sorted(set(disabled[provider]))
-            for model_index, model_id in enumerate(model_ids):
-                comma = "," if model_index < len(model_ids) - 1 else ""
+            for m_index, model_id in enumerate(model_ids):
+                comma = "," if m_index < len(model_ids) - 1 else ""
                 lines.append(
-                    '        %s: { "disabled": true }%s'
-                    % (json.dumps(model_id, ensure_ascii=False), comma)
+                    indent + "      " + json.dumps(model_id, ensure_ascii=False)
+                    + ': { "disabled": true }' + comma
                 )
-            lines.append("      }")
-            comma = "," if provider_index < len(providers) - 1 else ""
-            lines.append("    }%s" % comma)
-        lines.append("  },")
-    lines.append(END.rstrip("\n"))
+            lines.append(indent + "    }")
+            lines.append(indent + "  }" + ("," if p_index < len(providers) - 1 else ""))
+        lines.append(indent + "},")
+    lines.append(indent + end)
     return "\n".join(lines) + "\n"
 
 
@@ -248,34 +365,20 @@ def render_block(disabled: Dict[str, List[str]]) -> str:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Apply a free-model discovery document to opencode.jsonc"
-    )
+    parser = argparse.ArgumentParser(description="Apply free-model rules to opencode.jsonc")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--discovery", type=Path, help="discovery.json from discover.py")
-    source.add_argument("--paid-file", type=Path, help="legacy: one paid model id per line")
-    source.add_argument("--paid", help="legacy: comma/space separated paid model ids")
+    source.add_argument("--paid-file", type=Path, help="legacy fallback list (offline)")
     parser.add_argument("--config", type=Path, help="explicit config path")
-    parser.add_argument(
-        "--scope",
-        choices=("global", "project"),
-        default="global",
-        help="global config (default) or the nearest project config",
-    )
+    parser.add_argument("--state", type=Path, default=DEFAULT_STATE, help="tombstone state path")
+    parser.add_argument("--scope", choices=("global", "project"), default="global")
     parser.add_argument("--apply", action="store_true", help="write changes (default: dry-run)")
-    parser.add_argument("--dry-run", action="store_true", help="explicit dry-run (default)")
-    parser.add_argument(
-        "--disable-quota-free",
-        action="store_true",
-        help="also disable quota_free models (strict zero-cost-only mode)",
-    )
-    parser.add_argument(
-        "--include-unconfigured-providers",
-        action="store_true",
-        help="write disabled entries even for providers absent from the config",
-    )
-    parser.add_argument("--allow-symlink", action="store_true", help="allow writing through a symlink")
-    parser.add_argument("--json", action="store_true", help="print a machine-readable summary")
+    parser.add_argument("--dry-run", action="store_true", help="explicit dry-run")
+    parser.add_argument("--disable-quota-free", action="store_true")
+    parser.add_argument("--require-zero-retention", action="store_true")
+    parser.add_argument("--include-unconfigured-providers", action="store_true")
+    parser.add_argument("--allow-symlink", action="store_true")
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     if args.apply and args.dry_run:
@@ -283,209 +386,145 @@ def main() -> int:
         return 2
     dry_run = not args.apply
 
-    config_path = resolve_config(args.config, args.scope)
+    try:
+        config_path = resolve_config(args.config, args.scope)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
     if not config_path.exists():
         print("error: config not found: %s" % config_path, file=sys.stderr)
         return 2
     if config_path.is_symlink() and not args.allow_symlink:
-        print(
-            "error: config is a symlink; pass --allow-symlink if this is intentional",
-            file=sys.stderr,
-        )
+        print("error: config is a symlink; pass --allow-symlink if intentional", file=sys.stderr)
         return 2
 
-    raw_text = config_path.read_text(encoding="utf-8")
-    if raw_text.count(START) != 1 or raw_text.count(END) != 1:
-        print(
-            "error: expected exactly one managed block in %s. "
-            "Run scripts/install.sh first to add the markers." % config_path,
-            file=sys.stderr,
-        )
-        return 3
-    start_index = raw_text.find(START)
-    end_index = raw_text.find(END, start_index)
-    if end_index < 0:
-        print("error: managed block is not closed", file=sys.stderr)
+    raw = config_path.read_text(encoding="utf-8")
+    try:
+        block_start, block_end, indent, begin_marker, end_marker = find_managed_block(raw)
+        old_config = parse_jsonc(raw)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
         return 3
 
     try:
-        old_config = parse_jsonc(raw_text)
-    except ValueError as exc:
-        print("error: existing config is invalid: %s" % exc, file=sys.stderr)
-        return 3
+        if args.discovery:
+            discovered, discovery_doc = load_discovery(args.discovery)
+            source_label = str(args.discovery)
+        else:
+            discovered = legacy_discovery(read_paid_file(args.paid_file))
+            discovery_doc = {"schema_version": "1", "mode": "fallback-list"}
+            source_label = str(args.paid_file)
+    except (OSError, ValueError) as exc:
+        print("error: cannot read discovery source: %s" % exc, file=sys.stderr)
+        return 2
 
-    if args.discovery:
-        by_provider, discovery = load_discovery(args.discovery)
-        source_label = str(args.discovery)
-    elif args.paid_file:
-        by_provider, discovery = legacy_discovery(read_paid_file(args.paid_file))
-        source_label = str(args.paid_file)
-    else:
-        by_provider, discovery = legacy_discovery(re.split(r"[\s,]+", args.paid or ""))
-        source_label = "inline paid list"
-
-    disable_set = set(DISABLE_CLASSIFICATIONS)
+    allowed_classes = set(ALLOWED_CLASSIFICATIONS)
     if args.disable_quota_free:
-        disable_set.add("quota_free")
+        allowed_classes.discard("quota_free")
 
-    configured_providers: Set[str] = set()
-    providers_config = old_config.get("providers")
-    if isinstance(providers_config, dict):
-        configured_providers = {str(name) for name in providers_config.keys()}
+    allowed_keys: Set[Tuple[str, str]] = set()
+    for key, entry in discovered.items():
+        if entry.get("classification") not in allowed_classes:
+            continue
+        if args.require_zero_retention and entry.get("privacy_retention"):
+            continue
+        allowed_keys.add(key)
 
+    state_path = args.state.expanduser()
+    tombstones = load_state(state_path) | disabled_in_managed_block(raw, block_start, block_end)
+    to_disable: Set[Tuple[str, str]] = set()
+    for key in discovered:
+        if key not in allowed_keys:
+            to_disable.add(key)
+    for key in tombstones:
+        if key not in allowed_keys:
+            to_disable.add(key)
+
+    providers_conf = old_config.get("providers") or old_config.get("provider") or {}
+    configured = {str(p) for p in providers_conf} if isinstance(providers_conf, dict) else set()
+    skipped: Set[str] = set()
     disabled: Dict[str, List[str]] = {}
-    kept: Dict[str, List[str]] = {}
-    skipped_providers: Set[str] = set()
-
-    for provider, models in by_provider.items():
-        include = (
-            provider == "opencode"
-            or provider in configured_providers
-            or args.include_unconfigured_providers
-        )
-        if not include:
-            skipped_providers.add(provider)
+    for provider, model_id in sorted(to_disable):
+        if provider != "opencode" and provider not in configured and not args.include_unconfigured_providers:
+            skipped.add(provider)
             continue
-        for model in models:
-            classification = str(model.get("classification") or "unknown")
-            model_id = str(model.get("model_id") or "").strip()
-            if not model_id:
-                continue
-            if classification in disable_set:
-                disabled.setdefault(provider, []).append(model_id)
-            else:
-                kept.setdefault(provider, []).append(model_id)
-
-    # A runtime-only model can disappear from every catalog once it is disabled.
-    # Keep such previously managed ids disabled unless the new discovery
-    # explicitly classifies them as free. This prevents a re-enable loop.
-    discovered = {
-        (str(model.get("provider_id") or ""), str(model.get("model_id") or ""))
-        for models in by_provider.values()
-        for model in models
-    }
-    carried_over: List[Tuple[str, str]] = []
-    for provider_name, provider_conf in providers_config.items():
-        if not isinstance(provider_conf, dict):
-            continue
-        models_conf = provider_conf.get("models")
-        if not isinstance(models_conf, dict):
-            continue
-        for model_id, model_conf in models_conf.items():
-            if not isinstance(model_conf, dict) or model_conf.get("disabled") is not True:
-                continue
-            key = (str(provider_name), str(model_id))
-            if key in discovered:
-                continue
-            if model_id in disabled.get(str(provider_name), []):
-                continue
-            disabled.setdefault(str(provider_name), []).append(str(model_id))
-            carried_over.append(key)
-
-    # Protect the configured default model before writing anything.
-    default_ref = old_config.get("model")
-    default_provider = None
-    default_model = None
-    if isinstance(default_ref, str) and "/" in default_ref:
-        default_provider, default_model = default_ref.split("/", 1)
+        disabled.setdefault(provider, []).append(model_id)
 
     warnings: List[str] = []
-    if default_provider and default_model:
-        if default_model in disabled.get(default_provider, []):
+    if skipped:
+        names = sorted(skipped)
+        preview = ", ".join(names[:10]) + ("..." if len(names) > 10 else "")
+        warnings.append("unconfigured providers skipped (%d): %s" % (len(names), preview))
+
+    # Protect every model selector, not just the primary one.
+    protected = collect_protected_defaults(old_config)
+    for cfg_key, ref in sorted(protected.items()):
+        key = ref_to_key(ref)
+        if key is None:
+            warnings.append("%s=%r is not in provider/model form; kept unchanged" % (cfg_key, ref))
+            continue
+        if key in to_disable:
+            suggestions = ["%s/%s" % item for item in sorted(allowed_keys)][:5]
             print(
-                "error: refusing to disable the configured default model %s. "
-                "Change the default first or fix the discovery classification." % default_ref,
+                "[ABORT] %s selects '%s' which would be disabled.\n"
+                "Change it to a verified free model first. Suggestions: %s"
+                % (cfg_key, ref, ", ".join(suggestions) or "(none available)"),
                 file=sys.stderr,
             )
             return 4
-        for model in by_provider.get(default_provider, []):
-            if model.get("model_id") == default_model:
-                classification = str(model.get("classification") or "unknown")
-                if classification in disable_set:
-                    print(
-                        "error: default model %s is classified as %s. Refusing to apply."
-                        % (default_ref, classification),
-                        file=sys.stderr,
-                    )
-                    return 4
-                break
-        else:
-            warnings.append(
-                "default model %s is not present in the discovery document; kept unchanged"
-                % default_ref
-            )
-    elif default_ref:
-        warnings.append("default model %r is not in provider/model form; kept unchanged" % default_ref)
 
-    if skipped_providers:
-        warnings.append(
-            "providers not present in config were skipped: %s"
-            % ", ".join(sorted(skipped_providers))
-        )
-
-    block = render_block(disabled)
-    new_text = raw_text[:start_index] + block + raw_text[end_index + len(END):]
+    block = render_block(disabled, indent, begin_marker, end_marker)
+    new_raw = raw[:block_start] + block + raw[block_end:]
 
     try:
-        new_config = parse_jsonc(new_text)
+        new_config = parse_jsonc(new_raw)
     except ValueError as exc:
         print("error: generated config is invalid; nothing written: %s" % exc, file=sys.stderr)
         return 5
-
     if set(new_config.keys()) != set(old_config.keys()):
-        print(
-            "error: generated config changed top-level keys; nothing written",
-            file=sys.stderr,
-        )
+        print("error: generated config changed top-level keys; nothing written", file=sys.stderr)
         return 5
-    if new_config.get("model") != old_config.get("model"):
-        print("error: generated config changed the default model; nothing written", file=sys.stderr)
-        return 5
+    for selector in ("model", "small_model", "default_model"):
+        if new_config.get(selector) != old_config.get(selector):
+            print("error: generated config changed %s; nothing written" % selector, file=sys.stderr)
+            return 5
 
-    total_disabled = sum(len(ids) for ids in disabled.values())
-    total_kept = sum(len(ids) for ids in kept.values())
+    disabled_count = sum(len(ids) for ids in disabled.values())
     summary: Dict[str, Any] = {
         "status": "dry-run" if dry_run else "applied",
         "config": str(config_path),
         "source": source_label,
-        "default_model": default_ref,
-        "disabled_count": total_disabled,
-        "disabled_by_provider": {name: sorted(set(ids)) for name, ids in sorted(disabled.items())},
-        "kept_count": total_kept,
-        "carried_over_count": len(carried_over),
-        "carried_over": ["%s/%s" % item for item in sorted(carried_over)],
-        "skipped_providers": sorted(skipped_providers),
+        "allowed_count": len(allowed_keys),
+        "disabled_count": disabled_count,
+        "disabled_by_provider": {p: sorted(set(v)) for p, v in sorted(disabled.items())},
+        "tombstones": len(tombstones),
+        "skipped_providers": sorted(skipped),
         "warnings": warnings,
     }
-
     if dry_run:
         if args.json:
             print(json.dumps(summary, ensure_ascii=False, indent=2))
         else:
-            print("dry-run OK: %d model(s) would be disabled" % total_disabled)
-            for provider in sorted(disabled):
-                print("  %-12s %d" % (provider, len(set(disabled[provider]))))
+            print("dry-run OK: %d model(s) would be disabled, %d allowed" % (disabled_count, len(allowed_keys)))
             for warning in warnings:
                 print("  warning: %s" % warning)
-            if carried_over:
-                print("  carried over %d previously disabled id(s)" % len(carried_over))
             print("  config: %s" % config_path)
         return 0
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = config_path.with_name("%s.bak.%s" % (config_path.name, timestamp))
+    backup = config_path.with_name("%s.bak.%s" % (config_path.name, timestamp))
     counter = 1
-    while backup_path.exists():
-        backup_path = config_path.with_name(
-            "%s.bak.%s-%d" % (config_path.name, timestamp, counter)
-        )
+    while backup.exists():
+        backup = config_path.with_name("%s.bak.%s-%d" % (config_path.name, timestamp, counter))
         counter += 1
+    shutil.copy2(config_path, backup)
 
-    shutil.copy2(config_path, backup_path)
     fd, tmp_name = tempfile.mkstemp(prefix=config_path.name + ".tmp-", dir=str(config_path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(new_text)
+            handle.write(new_raw)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(tmp_name, stat.S_IMODE(config_path.stat().st_mode))
         os.replace(tmp_name, config_path)
     except BaseException:
@@ -495,30 +534,21 @@ def main() -> int:
             pass
         raise
 
-    # Re-read and validate the file that actually landed on disk.
     try:
         parse_jsonc(config_path.read_text(encoding="utf-8"))
     except ValueError as exc:
-        print(
-            "error: written config failed validation (%s); backup at %s"
-            % (exc, backup_path),
-            file=sys.stderr,
-        )
+        print("error: written config failed validation (%s); backup: %s" % (exc, backup), file=sys.stderr)
         return 6
 
-    summary["status"] = "applied"
-    summary["backup"] = str(backup_path)
+    save_state(state_path, {(p, m) for p, ids in disabled.items() for m in ids})
+    summary["backup"] = str(backup)
+    summary["state"] = str(state_path)
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     else:
-        print("applied: %d model(s) disabled" % total_disabled)
-        for provider in sorted(disabled):
-            print("  %-12s %d" % (provider, len(set(disabled[provider]))))
-        print("  backup: %s" % backup_path)
+        print("applied: %d model(s) disabled (backup: %s)" % (disabled_count, backup))
         for warning in warnings:
             print("  warning: %s" % warning)
-        if carried_over:
-            print("  carried over %d previously disabled id(s)" % len(carried_over))
     return 0
 
 

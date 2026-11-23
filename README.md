@@ -1,18 +1,24 @@
-# free-models-only
+# free-models-only v3.0
 
-مهارة OpenCode V2 تُبقي **النماذج المجانية فقط** في الكتالوج. تكتشف النماذج
-من واجهات رسمية، تصنّف تكلفتها، ثم تعطّل المدفوع وغير المعروف عبر
-`providers.<provider>.models.<id>.disabled = true`، وهي الآلية الموثّقة في
-[Providers](https://opencode.ai/docs/providers) و[Models](https://opencode.ai/docs/models).
+مهارة OpenCode تُبقي **النماذج المجانية فقط** في الكتالوج عبر جميع المزوّدين.
+تكتشف الأسعار من واجهات رسمية، وتصنّف كل نموذج بسياسة **Zero-Trust**، ثم
+تعطّل المدفوع وغير المعروف عبر
+`providers.<provider>.models.<id>.disabled = true`.
 
 لا تحتاج مفتاح API ولا رصيداً. لا تثبّت مزوّدين، ولا تكتب أسراراً، ولا
 تستخدم نموذجاً مدفوعاً كبديل.
 
-## لماذا
+## الجديد في 3.0
 
-كتالوج OpenCode ديناميكي: تظهر معرّفات مدفوعة جديدة وتختفي أخرى. القائمة
-الثابتة تتقادم بسرعة. هذه النسخة (2.0) تبني `discovery.json` من المصدر
-الرسمي في كل تشغيل، وتصنّف كل نموذج، ثم تطبّق النتيجة على الإعداد بأمان.
+- **One-Way Veto** من `models.dev`: أي سعر موجب يُعطّل النموذج فوراً، لكن غياب
+  السعر لا يمنح صفة «مجاني».
+- **حصص غير معلنة**: مزوّدون مثل Gemini/Groq/Cerebras/GitHub Models لا يعرضون
+  تسعيراً في `/v1/models` ⇒ `unknown` ويُعطّلون إلا بإثبات رسمي.
+- **Loopback Verification**: `local` فقط إذا كان `baseURL` محلياً فعلاً.
+- **حماية جميع مفاتيح النماذج**: `model`, `small_model`, `default_model`,
+  `agent.*.model`.
+- **Tombstones** في `state.json` لمنع عودة النماذج المعطّلة.
+- **فحص كل أبعاد التكلفة**: نص، تفكير، كاش، رسوم طلب، بحث، وسائط، شرائح، `-1`.
 
 ## التثبيت
 
@@ -22,7 +28,7 @@ git clone https://github.com/Ahmed-vrn/free-models-only.git \
 bash ~/.config/opencode/skills/free-models-only/scripts/install.sh
 ```
 
-OpenCode يكتشف المهارة تلقائياً من `~/.config/opencode/skills/<id>/SKILL.md`.
+OpenCode يكتشف المهارة تلقائياً من `SKILL.md`.
 
 ## الاستخدام
 
@@ -51,18 +57,23 @@ python3 scripts/probe.py \
 | --- | --- |
 | `--scope project` | استخدم أقرب `.opencode/opencode.jsonc` بدل الإعداد العام |
 | `--config PATH` | مسار صريح |
-| `--disable-quota-free` | عطّل أيضاً النماذج المجانية المحدودة الحصة |
-| `--include-unconfigured-providers` | اكتب تعطيلات لمزوّدين غير موجودين في الإعداد |
-| `--offline` | استخدم `references/paid-model-ids.txt` بلا شبكة |
+| `--no-runtime` | تجاهل `opencode models` |
+| `--offline` | إعادة استخدام الكاش + القائمة الاحتياطية بلا شبكة |
+| `--allow-lan-local` | اعتبار عناوين LAN الخاصة `local` |
+| `--disable-quota-free` | تعطيل أيضاً النماذج المجانية المحدودة الحصة |
+| `--require-zero-retention` | استبعاد النماذج التي تحتفظ بالمدخلات للتدريب |
+| `--include-unconfigured-providers` | كتابة تعطيلات لمزوّدين غير موجودين في الإعداد |
 
 ## التصنيف
 
-- `verified_zero`: سعر رسمي صفر لكل حقول التكلفة، ونموذج chat.
-- `quota_free`: مجاني ضمن حصة/حساب، مثل OpenRouter `:free`.
-- `funded_account_required`: يحتاج شحناً أو رصيداً.
-- `local`: تشغيل محلي.
-- `paid`: سعر موجب.
-- `unknown`: سعر أو نوع غير مؤكد، ويُعطّل.
+| التصنيف | المعنى |
+| --- | --- |
+| `verified_zero` | سعر رسمي صفر في كل الحقول، نموذج محادثة، بلا شرائح |
+| `quota_free` | صفر لكن بحساب/مفتاح وحصة محدودة |
+| `funded_account_required` | يحتاج رصيداً أو بطاقة |
+| `local` | محلي مثبَت شبكياً بلا فاتورة API |
+| `paid` | أي تكلفة موجبة أو شرائح تصاعدية |
+| `unknown` | سعر مفقود/ديناميكي/غير مؤكد ⇒ يُعطّل |
 
 السعر المفقود لا يُعامل أبداً كصفر.
 
@@ -70,37 +81,31 @@ python3 scripts/probe.py \
 
 | المسار | الوظيفة |
 | --- | --- |
-| `SKILL.md` | تعليمات المهارة وسير العمل. |
-| `scripts/discover.py` | يجلب OpenCode + OpenRouter ويصنّف ويكتب `discovery.json`. |
-| `scripts/apply.py` | يطبّق التعطيلات داخل الكتلة المُدارة فقط، مع حماية الافتراضي. |
+| `SKILL.md` | تعليمات المهارة وسياسة التصنيف. |
+| `scripts/discover.py` | محوّلات OpenCode + OpenRouter + `models.dev` + runtime + loopback. |
+| `scripts/apply.py` | تطبيق ذري مع حماية كل مفاتيح النماذج و`tombstones`. |
 | `scripts/probe.py` | فحص دخان محدود عبر OpenCode CLI. |
-| `scripts/install.sh` | تثبيت/تطبيق، مع `--dry-run` و`--offline`. |
+| `scripts/opencode_cli.py` | تحديد مسار الـ CLI وقراءة `opencode models`. |
+| `scripts/install.sh` | تثبيت/تطبيق مع `--dry-run` و`--offline`. |
 | `scripts/update.sh` | `git pull` + إعادة التطبيق. |
-| `scripts/uninstall.sh` | إزالة الكتلة المُدارة فقط. |
-| `references/paid-model-ids.txt` | قائمة احتياطية مولّدة من الأسعار الرسمية. |
+| `scripts/uninstall.sh` | إزالة الكتلة المُدارة فقط مع الاحتفاظ بـ `state.json`. |
+| `references/paid-model-ids.txt` | قائمة احتياطية للتشغيل دون شبكة. |
 | `tests/` | اختبارات بلا شبكة. |
-| `.github/workflows/validate.yml` | تشغيل الاختبارات عند كل push/PR. |
+| `.github/workflows/validate.yml` | تحقق عند كل push/PR. |
 
 ## الأمان
 
 - dry-run افتراضي؛ الكتابة تحتاج `--apply`.
-- نسخة احتياطية قبل كل كتابة، وكتابة ذرية `tmp + rename`.
-- رفض تعطيل النموذج الافتراضي.
-- الحفاظ على التعليقات وكل ما هو خارج العلامات.
-- عدم إعادة تفعيل معرّف معطّل اختفى من كل المصادر (يبقى `unknown`)، مع
-  إعادة تفعيله إذا ظهر مجدداً كمجاني.
-- رفض الملفات الرمزية (symlinks) افتراضياً.
+- نسخة احتياطية مؤرخة قبل كل كتابة، وكتابة ذرية `tmp + fsync + rename`.
+- رفض تعطيل أي نموذج افتراضي أو نموذج وكيل.
+- الحفاظ على التعليقات وكل ما هو خارج العلامات؛ دعم علامات v2 القديمة.
+- رفض الملفات الرمزية (`symlinks`) افتراضياً.
 - لا مفاتيح API ولا حزم جديدة ولا مهام مجدولة تلقائياً.
 
-## التحديث
+## التحديث والإزالة
 
 ```bash
 bash ~/.config/opencode/skills/free-models-only/scripts/update.sh
-```
-
-## الإزالة
-
-```bash
 bash ~/.config/opencode/skills/free-models-only/scripts/uninstall.sh
 ```
 

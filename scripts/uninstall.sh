@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Remove the managed block from the OpenCode config (keeps the skill directory).
+# Remove the managed block from the OpenCode config (keeps the skill directory
+# and the tombstone state so a later reinstall does not resurrect paid models).
 set -euo pipefail
 
 CONFIG="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.jsonc}"
@@ -20,16 +21,35 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 text = path.read_text(encoding="utf-8")
-start = "  // >>> free-models-only: START (managed — do not edit manually)\n"
-end = "  // <<< free-models-only: END\n"
-first = text.find(start)
-last = text.find(end)
-if first < 0 or last < 0 or last <= first:
-    print("managed block not found; nothing to remove")
+styles = (
+    ("  // BEGIN free-models-only\n", "  // END free-models-only\n"),
+    ("  // >>> free-models-only: START (managed — do not edit manually)\n",
+     "  // <<< free-models-only: END\n"),
+)
+
+def span(token):
+    idx = text.find(token)
+    if idx < 0:
+        return None
+    line_start = text.rfind("\n", 0, idx) + 1
+    newline = text.find("\n", idx)
+    line_end = len(text) if newline < 0 else newline + 1
+    return line_start, line_end
+
+found = []
+for begin, end in styles:
+    b, e = span(begin), span(end)
+    if b and e and b[1] <= e[0]:
+        found.append((b[0], e[1]))
+if len(found) != 1:
+    print("managed block not found or ambiguous; nothing to remove")
     raise SystemExit(0)
 
 backup = path.with_name(path.name + ".bak.uninstall")
 backup.write_text(text, encoding="utf-8")
-path.write_text(text[:first] + text[last + len(end):], encoding="utf-8")
+start, end = found[0]
+path.write_text(text[:start] + text[end:], encoding="utf-8")
 print("managed block removed from %s (backup: %s)" % (path, backup))
 PY
+
+echo "Tombstone state kept at: ${HOME}/.cache/free-models-only/state.json"

@@ -1,7 +1,8 @@
-# Paid OpenCode catalog model IDs.
-# Generated from https://opencode.ai/inference/v1/models on 2026-11-21.
+# Paid OpenCode catalog model IDs (v3 fallback list).
+# Generated from official positive cost fields on 2026-11-21.
 # A model is listed only when at least one official cost field is positive.
-# This file is a fallback for --no-discovery; discovery.json is authoritative.
+# Used only by `install.sh --offline` / `--paid-file`; discovery.json is authoritative.
+# One-way veto: models.dev may add more paid ids at discovery time.
 bge-m3
 claude-fable-5
 claude-fable-5-1

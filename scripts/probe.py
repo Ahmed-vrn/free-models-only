@@ -54,7 +54,8 @@ def read_default_model(config_path: Path) -> Optional[str]:
 
 def load_discovery(path: Path) -> Dict[str, Any]:
     payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    version = str(payload.get("schema_version", "")) if isinstance(payload, dict) else ""
+    if not isinstance(payload, dict) or version not in ("1", "3", "3.0"):
         raise SystemExit("error: unsupported discovery file: %s" % path)
     if not isinstance(payload.get("models"), list):
         raise SystemExit("error: discovery file has no models array: %s" % path)
@@ -69,6 +70,8 @@ def write_atomic(path: Path, payload: Dict[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp_name, path)
     except BaseException:
         try:
@@ -89,6 +92,7 @@ def select_models(
     include_quota_free: bool,
     allow_nonfree: bool,
     default_ref: Optional[str],
+    require_zero_retention: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     models = [m for m in payload.get("models", []) if isinstance(m, dict)]
     by_ref = {model_ref(model): model for model in models}
@@ -115,6 +119,9 @@ def select_models(
                     % ref
                 )
                 continue
+            if require_zero_retention and model.get("privacy_retention"):
+                warnings.append("skipping %s (privacy_retention)" % ref)
+                continue
             selected.append(model)
         return selected[:limit], warnings
 
@@ -123,6 +130,8 @@ def select_models(
         classification = str(model.get("classification") or "unknown")
         kind = str(model.get("kind") or "other")
         if kind != "chat":
+            continue
+        if require_zero_retention and model.get("privacy_retention"):
             continue
         if classification == "verified_zero":
             candidates.append(model)
@@ -204,6 +213,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=90, help="per-model timeout in seconds")
     parser.add_argument("--include-quota-free", action="store_true")
     parser.add_argument("--allow-nonfree", action="store_true")
+    parser.add_argument("--require-zero-retention", action="store_true")
     parser.add_argument("--no-write", action="store_true", help="do not update discovery.json")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -227,6 +237,7 @@ def main() -> int:
         args.include_quota_free,
         args.allow_nonfree,
         default_ref,
+        args.require_zero_retention,
     )
 
     for warning in warnings:
